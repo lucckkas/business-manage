@@ -1,0 +1,63 @@
+name: Validate and package
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --prefix web --no-fund --no-audit
+      - name: Development proxy regression
+        run: npm --prefix web run test:proxy
+      - name: Build portable package
+        run: node scripts/build.mjs --current
+      - name: Check generated contracts
+        run: git diff --exit-code -- api/openapi.json web/src/api/schema.ts
+      - name: Native portable acceptance
+        run: node scripts/smoke.mjs
+      - run: go vet ./...
+      - run: go test -race -v ./...
+      - name: Browser acceptance on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          npx --prefix web playwright install --with-deps chromium
+          erp_test_dir="$(mktemp -d)/data"
+          artifacts/erp-linux-amd64 serve --data-dir "$erp_test_dir" > /tmp/raiz-e2e.log 2>&1 &
+          erp_test_pid=$!
+          trap 'kill "$erp_test_pid" || true' EXIT
+          for attempt in $(seq 1 50); do
+            if curl --fail --silent http://127.0.0.1:8080/api/v1/health >/dev/null; then break; fi
+            sleep 0.2
+          done
+          ERP_TEST_DATA_DIR="$erp_test_dir" npm --prefix web run test:e2e
+      - uses: actions/upload-artifact@v4
+        with:
+          name: raiz-erp-${{ runner.os }}
+          path: |
+            artifacts/*.zip
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        if: failure() && runner.os == 'Linux'
+        with:
+          name: browser-failures
+          path: web/test-results/
